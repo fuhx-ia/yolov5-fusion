@@ -30,61 +30,78 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+'''===================2.获取当前文件的绝对路径========================'''
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from models.common import DetectMultiBackend
-from utils.callbacks import Callbacks
-from utils.dataloaders import create_dataloader
+'''===================3.加载自定义模块============================'''
+from models.common import DetectMultiBackend   # yolov5的网络结构(yolov5)
+from utils.callbacks import Callbacks  # 和日志相关的回调函数
+from utils.dataloaders import create_dataloader  # 加载数据集的函数
 from utils.general import (LOGGER, TQDM_BAR_FORMAT, Profile, check_dataset, check_img_size, check_requirements,
                            check_yaml, coco80_to_coco91_class, colorstr, increment_path, non_max_suppression,
-                           print_args, scale_boxes, xywh2xyxy, xyxy2xywh)
-from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
-from utils.plots import output_to_target, plot_images, plot_val_study
-from utils.torch_utils import select_device, smart_inference_mode
+                           print_args, scale_boxes, xywh2xyxy, xyxy2xywh)  # 定义了一些常用的工具函数
+from utils.metrics import ConfusionMatrix, ap_per_class, box_iou  # 模型验证指标，包括ap，混淆矩阵等
+from utils.plots import output_to_target, plot_images, plot_val_study  # 定义了Annotator类，可以在图像上绘制矩形框和标注信息
+from utils.torch_utils import select_device, smart_inference_mode  # 定义了一些与PyTorch有关的工具函数
 
 
+'''======================1.保存预测信息到txt文件====================='''
 def save_one_txt(predn, save_conf, shape, file):
     # Save one txt result
+    # gn = [w, h, w, h] 对应图片的宽高  用于后面归一化
     gn = torch.tensor(shape)[[1, 0, 1, 0]]  # normalization gain whwh
+    # 将每个图片的预测信息分别存入save_dir/labels下的xxx.txt中 每行: class_id + score + xywh
     for *xyxy, conf, cls in predn.tolist():
+        # 将xyxy(左上角+右下角)格式转为xywh(中心点+宽高)格式，并归一化，转化为列表再保存
         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+        # line的形式是： "类别 xywh"，若save_conf为true，则line的形式是："类别 xywh 置信度"
         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
         with open(file, 'a') as f:
+            # 写入对应的文件夹里，路径默认为“runs\detect\exp*\labels”
             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
 
+'''======================2.保存预测信息到coco格式的json字典====================='''
 def save_one_json(predn, jdict, path, class_map):
     # Save one JSON result {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
+    # 获取图片id
     image_id = int(path.stem) if path.stem.isnumeric() else path.stem
+    # 获取预测框 并将xyxy转为xywh格式
     box = xyxy2xywh(predn[:, :4])  # xywh
-    box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+    box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner  中心点坐标 -> 左上角坐标
+    # 序列解包
     for p, b in zip(predn.tolist(), box.tolist()):
         jdict.append({
             'image_id': image_id,
-            'category_id': class_map[int(p[5])],
-            'bbox': [round(x, 3) for x in b],
-            'score': round(p[4], 5)})
+            'category_id': class_map[int(p[5])],  # 类别 coco91class()从索引0~79映射到索引0~90
+            'bbox': [round(x, 3) for x in b],  # 预测框坐标
+            'score': round(p[4], 5)})  # 预测得分
 
 
+'''========================三、计算指标==========================='''
 def process_batch(detections, labels, iouv):
     """
     Return correct prediction matrix
+    返回每个预测框在10个IoU阈值上是TP还是FP
     Arguments:
         detections (array[N, 6]), x1, y1, x2, y2, conf, class
         labels (array[M, 5]), class, x1, y1, x2, y2
     Returns:
         correct (array[N, 10]), for 10 IoU levels
     """
+    # 构建一个[pred_nums, 10]全为False的矩阵
     correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
+    # 计算每个gt与每个pred的iou，shape为: [gt_nums, pred_nums]
     iou = box_iou(labels[:, 1:], detections[:, :4])
     correct_class = labels[:, 0:1] == detections[:, 5]
     for i in range(len(iouv)):
+        # iou超过阈值而且类别正确，则为True，返回索引
         x = torch.where((iou >= iouv[i]) & correct_class)  # IoU > threshold and classes match
-        if x[0].shape[0]:
+        if x[0].shape[0]:   # 至少有一个TP
             matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
             if x[0].shape[0] > 1:
                 matches = matches[matches[:, 2].argsort()[::-1]]
@@ -129,19 +146,25 @@ def run(
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
+        # 获得记录在模型中的设备 next为迭代器
         device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
+        # 精度减半
+        # 如果设备类型不是cpu 则将模型由32位浮点数转换为16位浮点数
         half &= device.type != 'cpu'  # half precision only supported on CUDA
         model.half() if half else model.float()
-    else:  # called directly
+    else:  # called directly# 直接通过 val.py 调用 run 函数
+        # 调用torch_utils中select_device来选择执行程序时的设备
         device = select_device(device, batch_size=batch_size)
 
-        # Directories
+        # Directories  # 调用genera.py中的increment_path函数来生成save_dir文件路径  run\test\expn
         save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
+        # mkdir创建路径最后一级目录
         (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
         # Load model
         model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
         stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
+        # 调用general.py中的check_img_size函数来检查图像分辨率能否被32整除
         imgsz = check_img_size(imgsz, s=stride)  # check image size
         half = model.fp16  # FP16 supported on limited backends with CUDA
         if engine:
@@ -155,15 +178,17 @@ def run(
         # Data
         data = check_dataset(data)  # check
 
-    # Configure
+    # Configure '''======================3.加载配置====================='''
     model.eval()
     cuda = device.type != 'cpu'
     is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
     nc = 1 if single_cls else int(data['nc'])  # number of classes
+    # 计算mAP相关参数
     iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
+    # numel为pytorch预置函数 用来获取张量中的元素个数
     niou = iouv.numel()
 
-    # Dataloader
+    # Dataloader '''======================4.加载val数据集====================='''
     if not training:
         if pt and not single_cls:  # check --weights are trained on --data
             ncm = model.model.nc
@@ -181,20 +206,30 @@ def run(
                                        rect=rect,
                                        workers=workers,
                                        prefix=colorstr(f'{task}: '))[0]
-
+    '''======================5.初始化====================='''
+    # 初始化已完成测试的图片数量
     seen = 0
+    # 调用matrics中函数 存储混淆矩阵
     confusion_matrix = ConfusionMatrix(nc=nc)
+    # 获取数据集所有类别的类名
     names = model.names if hasattr(model, 'names') else model.module.names  # get class names
     if isinstance(names, (list, tuple)):  # old format
         names = dict(enumerate(names))
+    # 调用general.py中的函数  获取coco数据集的类别索引
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
+    # 设置tqdm进度条的显示信息
     s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
+    # 初始化detection中各个指标的值
     tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     dt = Profile(), Profile(), Profile()  # profiling times
+    # 初始化网络训练的loss
     loss = torch.zeros(3, device=device)
+    # 初始化json文件涉及到的字典、统计信息、AP、每一个类别的AP、图片汇总
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
+
+    '''===6.1 开始验证前的预处理==='''
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         callbacks.run('on_val_batch_start')
         with dt[0]:
@@ -203,20 +238,28 @@ def run(
                 targets = targets.to(device)
             im = im.half() if half else im.float()  # uint8 to fp16/32
             im /= 255  # 0 - 255 to 0.0 - 1.0
+            # 四个变量分别代表batchsize、通道数目、图像高度、图像宽度
             nb, _, height, width = im.shape  # batch size, channels, height, width
 
+        '''===6.2 前向推理==='''
         # Inference
         with dt[1]:
             preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
 
         # Loss
+        # compute_loss不为空 说明正在执行train.py  根据传入的compute_loss计算损失值
         if compute_loss:
+            # loss 包含bounding box 回归的GIoU、object和class 三者的损失
             loss += compute_loss(train_out, targets)[1]  # box, obj, cls
 
         # NMS
+        # targets: [num_target, img_index+class_index+xywh] = [31, 6]
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
+        # 提取batch中每一张图片的目标的label
+        # lb: {list: bs} 第一张图片的target[17, 5] 第二张[1, 5] 第三张[7, 5] 第四张[6, 5]
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
-        with dt[2]:
+        # 计算NMS过程所需要的时间
+        with dt[2]:  # 进行非极大值抑制操作
             preds = non_max_suppression(preds,
                                         conf_thres,
                                         iou_thres,
@@ -224,17 +267,24 @@ def run(
                                         multi_label=True,
                                         agnostic=single_cls,
                                         max_det=max_det)
-
-        # Metrics
+        '''===6.5 统计真实框、预测框信息==='''
+        # Metrics  si代表第si张图片，pred是对应图片预测的label信息
         for si, pred in enumerate(preds):
+            # 获取第si张图片的gt标签信息 包括class, x, y, w, h    target[:, 0]为标签属于哪张图片的编号
             labels = targets[targets[:, 0] == si, 1:]
+            # nl为图片检测到的目标个数
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
+            # 第si张图片对应的文件路径
             path, shape = Path(paths[si]), shapes[si][0]
             correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
+            # 统计测试图片数量 +1
             seen += 1
 
+            # 如果预测为空，则添加空的信息到stats里
             if npr == 0:
-                if nl:
+                if nl:  # 预测为空但同时有label信息
+                    # stats初始化为一个空列表[] 此处添加一个空信息
+                    # 添加的每一个元素均为tuple 其中第二第三个变量为一个空的tensor
                     stats.append((correct, *torch.zeros((2, 0), device=device), labels[:, 0]))
                     if plots:
                         confusion_matrix.process_batch(detections=None, labels=labels[:, 0])
@@ -243,16 +293,24 @@ def run(
             # Predictions
             if single_cls:
                 pred[:, 5] = 0
+            # 对pred进行深复制
             predn = pred.clone()
+            # 调用general.py中的函数 将图片调整为原图大小
             scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
 
             # Evaluate
+            # 预测框评估
             if nl:
+                # 获得xyxy格式的框
                 tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                # 调用general.py中的函数 将图片调整为原图大小
                 scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                # 处理完gt的尺寸信息，重新构建成 (cls, xyxy)的格式
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
+                # 对当前的预测框与gt进行一一匹配，并且在预测框的对应位置上获取iou的评分信息，其余没有匹配上的预测框设置为False
                 correct = process_batch(predn, labelsn, iouv)
                 if plots:
+                    # 计算混淆矩阵 confusion_matrix
                     confusion_matrix.process_batch(predn, labelsn)
             stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
 
@@ -263,14 +321,16 @@ def run(
                 save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
             callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
 
-        # Plot images
+        # Plot images   '''===6.6 画出前三个batch图片的gt和pred框==='''
+        # 画出前三个batch的图片的ground truth和预测框predictions(两个图)一起保存
         if plots and batch_i < 3:
             plot_images(im, targets, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
             plot_images(im, output_to_target(preds), paths, save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
 
         callbacks.run('on_val_batch_end', batch_i, im, targets, paths, shapes, preds)
 
-    # Compute metrics
+    # Compute metrics  '''===6.7 计算指标==='''
+    # 将stats列表的信息拼接到一起
     stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
         tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
@@ -278,7 +338,7 @@ def run(
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
     nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
 
-    # Print results
+    # Print results  '''===6.8 打印日志==='''
     pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
     LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
     if nt.sum() == 0:
@@ -295,12 +355,13 @@ def run(
         shape = (batch_size, 3, imgsz, imgsz)
         LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
 
+    '''===6.9 保存验证结果==='''
     # Plots
     if plots:
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
         callbacks.run('on_val_end', nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix)
 
-    # Save JSON
+    # Save JSON  # 采用之前保存的json文件格式预测结果 通过coco的api评估各个指标
     if save_json and len(jdict):
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
         anno_json = str(Path('../datasets/coco/annotations/instances_val2017.json'))  # annotations
@@ -326,7 +387,7 @@ def run(
         except Exception as e:
             LOGGER.info(f'pycocotools unable to run: {e}')
 
-    # Return results
+    # Return results  '''===6.10 返回结果==='''
     model.float()  # for training
     if not training:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
@@ -370,9 +431,10 @@ def parse_opt():
 
 
 def main(opt):
+    # 检测requirements文件中需要的包是否安装好了
     check_requirements(exclude=('tensorboard', 'thop'))
 
-    if opt.task in ('train', 'val', 'test'):  # run normally
+    if opt.task in ('train', 'val', 'test'):  # run normally  如果task in ['train', 'val', 'test']就正常测试 训练集/验证集/测试集
         if opt.conf_thres > 0.001:  # https://github.com/ultralytics/yolov5/issues/1466
             LOGGER.info(f'WARNING ⚠️ confidence threshold {opt.conf_thres} > 0.001 produces invalid results')
         if opt.save_hybrid:

@@ -255,13 +255,13 @@ class LoadImages:
 
         images = [x for x in files if x.split('.')[-1].lower() in IMG_FORMATS]
         videos = [x for x in files if x.split('.')[-1].lower() in VID_FORMATS]
-        ni, nv = len(images), len(videos)
+        ni, nv = len(images), len(videos)  # 图片列表和视频列表大小
 
         self.img_size = img_size
         self.stride = stride
         self.files = images + videos
         self.nf = ni + nv  # number of files
-        self.video_flag = [False] * ni + [True] * nv
+        self.video_flag = [False] * ni + [True] * nv  # 视频标志
         self.mode = 'image'
         self.auto = auto
         self.transforms = transforms  # optional
