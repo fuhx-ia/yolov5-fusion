@@ -452,6 +452,7 @@ def train(hyp,  # 超参数 可以是超参数配置文件的路径或超参数�
                     loss *= 4.
 
             # Backward  反向传播 scale为使用自动混合精度运算
+            torch.use_deterministic_algorithms(False)  # cbam注意力机制
             scaler.scale(loss).backward()
 
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
@@ -619,7 +620,7 @@ def train(hyp,  # 超参数 可以是超参数配置文件的路径或超参数�
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default=ROOT / 'yolov5s.pt', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default=ROOT / 'models/yolov5s_m3fd.yaml', help='model.yaml path')
+    parser.add_argument('--cfg', type=str, default=ROOT / 'models/yolov5s_m3fd_ca_smallTarget.yaml', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/m3fd.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=100, help='total training epochs')
@@ -641,7 +642,7 @@ def parse_opt(known=False):
     parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam', 'AdamW'], default='SGD', help='optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--workers', type=int, default=0, help='max dataloader workers (per RANK in DDP mode)')
-    parser.add_argument('--project', default=ROOT / 'runs/YOLOv5(7.0)-fusion-test', help='save to project/name')
+    parser.add_argument('--project', default=ROOT / 'runs/YOLOv5(7.0)-fusion', help='save to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
